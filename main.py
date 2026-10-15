@@ -1,27 +1,25 @@
-import json
 import os
 import re
-import time
-from decimal import Decimal
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_TITLE = "Acme Appliances Ledger Q&A"
-QUESTION_DATA_URL = os.getenv(
+APP_TITLE = "Acme Appliances Ledger Agent"
+ROOT_URL = os.getenv(
     "QUESTION_DATA_URL",
-    "https://exam.sanand.workers.dev/questionData?email=23f2005137%40ds.study.iitm.ac.in&quizSign=D95NJNYho6djNgotOhZUm5HgUyl0HVgCqSRmILKaUU5MR6l3IE6ZB8jo7cp2%2BTD55IFZKxKigJe6OyrGVr1Wo7L8tVxydJmv59DSQjfag23XiwSPjrGsB8yRqk1ZnBuuXxZNjKRUYmkQwRlYxq7B%2BXLB6biK8sJ4L4lE%2FMTtxtg0V6uLBMOK98MN1V4RaiLFHobyRq%2BlvfrwxXopsARtoACvJDiWeY3u3vicawxzAeRKun3%2BnUsmN4BWEt3iB0Df2NVVDcyJt1mdpSEyULArVIeWLlTziLoD9HyZblzeo30hfI%2FMdBw4BOHtRDrtTLjLcwb%2BBm0sLx80foJDffsMwQ%3D%3D&questionId=q-ledger-agent-server&path=/",
+    "https://exam.sanand.workers.dev/questionData?email=23f2005137%40ds.study.iitm.ac.in&quizSign=D95NJNYho6djNgotOhZUm5HgUyl0HVgCqSRmILKaUU5MR6l3IE6ZB8jo7cp2%2BTD55IFZKxKigJe6OyrGVr1Wo7L8tVxydJmv59DSQjfag23XiwSPjrGsB8yRqk1ZnBuuXxZNjKRUYmkQwRlYxq7B%2BXLB6biK8sJ4L4lE%2FMTtxtg0V6uLBMOK98MN1V4RaiLFHobyRq%2BlvfrwxXopsARtoACvJDiWeY3u3vicawxzAeRKun3%2BnUsmN4BWEt3iB0Df2NVVDcyJt1mdpSEyULArVIeWLlTziLoD9HyZblzeo30hfI%2FMdBw4BOHtRDrtTLjLcwb%2BBm0sLx80foJDffsMwQ%3D%3D&questionId=q-ledger-agent-server&path=%2F",
 )
-EMAIL = "23f2005137@ds.study.iitm.ac.in"
-TIMEOUT = 8
-MAX_PAGES = 40
+TIMEOUT = 20
+MAX_PAGES = 200
 
 app = FastAPI(title=APP_TITLE)
-session = requests.Session()
-session.headers.update({"User-Agent": "AcmeLedgerQuestionAgent/1.0", "Accept": "application/json"})
+http = requests.Session()
+http.headers.update({"Accept": "application/json", "User-Agent": "AcmeLedgerAgent/2.0"})
 
 
 class Question(BaseModel):
@@ -29,263 +27,214 @@ class Question(BaseModel):
 
 
 def get_json(url: str) -> Any:
-    response = session.get(url, timeout=TIMEOUT)
-    response.raise_for_status()
-    ctype = response.headers.get("content-type", "")
-    if "json" in ctype:
-        return response.json()
+    r = http.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_paginated(url: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    current = url
+    for _ in range(MAX_PAGES):
+        if not current or current in seen_urls:
+            break
+        seen_urls.add(current)
+        payload = get_json(current)
+        if isinstance(payload, list):
+            rows.extend(x for x in payload if isinstance(x, dict))
+            break
+        if not isinstance(payload, dict):
+            break
+        batch = payload.get("orders", payload.get("data", payload.get("results", [])))
+        if isinstance(batch, list):
+            rows.extend(x for x in batch if isinstance(x, dict))
+        current = payload.get("next")
+    return rows
+
+
+def load_ledger():
+    entry = get_json(ROOT_URL)
+    links = entry.get("links", {}) if isinstance(entry, dict) else {}
+    orders_url = links.get("orders")
+    rates_url = links.get("rates")
+    if not orders_url or not rates_url:
+        raise RuntimeError("Root API response did not contain links.orders and links.rates")
+    raw_rows = fetch_paginated(orders_url)
+    rate_payload = get_json(rates_url)
+    rates = rate_payload.get("usd_per_unit", {})
+    # The source may repeat order IDs; keep the row with latest updated_at.
+    current: dict[str, dict[str, Any]] = {}
+    for row in raw_rows:
+        oid = str(row.get("id", "")).strip()
+        if not oid:
+            continue
+        previous = current.get(oid)
+        if previous is None or parse_dt(row.get("updated_at")) >= parse_dt(previous.get("updated_at")):
+            current[oid] = row
+    return list(current.values()), rates, len(raw_rows), len(current)
+
+
+def parse_dt(value: Any) -> datetime:
+    if not value:
+        return datetime.min
     try:
-        return response.json()
+        s = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            from zoneinfo import ZoneInfo
+            dt = dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        return dt.timestamp() and datetime.fromtimestamp(dt.timestamp(), tz=dt.tzinfo)
     except Exception:
-        return response.text
+        return datetime.min
 
 
-def extract_urls(obj: Any, base_url: str) -> list[str]:
-    found = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, str) and (
-                k.lower() in {"url", "href", "endpoint", "api", "openapi", "swagger", "docs", "baseurl", "base_url", "next"}
-                or v.startswith("/") or v.startswith("http")
-            ):
-                if v.startswith(("http://", "https://", "/")):
-                    found.append(urljoin(base_url, v))
-            else:
-                found.extend(extract_urls(v, base_url))
-    elif isinstance(obj, list):
-        for v in obj:
-            found.extend(extract_urls(v, base_url))
-    return found
-
-
-def load_source() -> tuple[Any, dict[str, Any]]:
+def dec(value: Any) -> Decimal:
     try:
-        entry = get_json(QUESTION_DATA_URL)
-    except Exception as e:
-        return {"load_error": str(e), "entry_url": QUESTION_DATA_URL}, {}
-    root = urlparse(QUESTION_DATA_URL)
-    candidates = [QUESTION_DATA_URL]
-    candidates.extend(extract_urls(entry, QUESTION_DATA_URL))
-    candidates.extend([
-        f"{root.scheme}://{root.netloc}/",
-        f"{root.scheme}://{root.netloc}/openapi.json",
-        f"{root.scheme}://{root.netloc}/swagger.json",
-        f"{root.scheme}://{root.netloc}/docs",
-    ])
-    visited: dict[str, Any] = {}
-    queue = list(dict.fromkeys(candidates))
-    while queue and len(visited) < MAX_PAGES:
-        url = queue.pop(0)
-        if url in visited:
-            continue
-        try:
-            data = get_json(url)
-        except Exception:
-            continue
-        visited[url] = data
-        for child in extract_urls(data, url):
-            if child not in visited and child not in queue and len(queue) < MAX_PAGES:
-                queue.append(child)
-    return entry, visited
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
 
 
-ENTRY_DATA: Any = {}
-DISCOVERED: dict[str, Any] = {}
+def amount_usd(row: dict[str, Any], rates: dict[str, Any]) -> Decimal:
+    currency = str(row.get("currency", "USD")).upper()
+    rate = dec(rates.get(currency, 1 if currency == "USD" else 0))
+    return dec(row.get("amount", dec(row.get("qty", 0)) * dec(row.get("unit_price", 0)))) * rate
+
+
+def parse_query_date(question: str):
+    q = question.lower()
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    months = {
+        "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+        "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+        "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
+        "november": 11, "nov": 11, "december": 12, "dec": 12,
+    }
+    month = next((n for name, n in months.items() if re.search(r"\b" + re.escape(name) + r"\b", q)), None)
+    return (int(year_match.group(1)) if year_match else None), month
+
+
+def order_date(row):
+    return parse_dt(row.get("created_at"))
+
+
+def answer_question(question: str, rows: list[dict[str, Any]], rates: dict[str, Any]):
+    q = question.strip()
+    ql = q.lower()
+    year, month = parse_query_date(q)
+    filtered = rows[:]
+
+    # Date filters apply to created_at; timestamps are parsed with timezone offsets.
+    if year or month:
+        filtered = [r for r in filtered if (
+            (not year or (order_date(r) != datetime.min and order_date(r).year == year))
+            and (not month or (order_date(r) != datetime.min and order_date(r).month == month))
+        )]
+
+    regions = ["north", "south", "east", "west", "central"]
+    region = next((x for x in regions if re.search(r"\b" + x + r"\b", ql)), None)
+    if region:
+        filtered = [r for r in filtered if str(r.get("region", "")).lower() == region]
+
+    products = sorted({str(r.get("product", "")) for r in rows if r.get("product")}, key=len, reverse=True)
+    product = next((p for p in products if p.lower() in ql), None)
+    if product:
+        filtered = [r for r in filtered if str(r.get("product", "")).lower() == product.lower()]
+
+    customer_match = re.search(r"\bC\d{4}\b", q, re.I)
+    if customer_match:
+        cid = customer_match.group(0).upper()
+        filtered = [r for r in filtered if str(r.get("customer", "")).upper() == cid]
+
+    # Revenue is explicitly limited to current paid orders.
+    if any(k in ql for k in ["revenue", "sales", "turnover", "total amount", "total value"]):
+        paid = [r for r in filtered if str(r.get("status", "")).lower() == "paid"]
+        total = sum((amount_usd(r, rates) for r in paid), Decimal("0"))
+        return {
+            "answer": f"USD {total.quantize(Decimal('0.01'))}",
+            "currency": "USD",
+            "orders_counted": len(paid),
+            "rule": "Only current orders with status 'paid' count as revenue.",
+        }
+
+    if "how many" in ql or "count" in ql or "number of" in ql:
+        if "customer" in ql and any(k in ql for k in ["unique", "distinct", "different"]):
+            return {"answer": len({r.get("customer") for r in filtered if r.get("customer")})}
+        return {"answer": len(filtered)}
+
+    if any(k in ql for k in ["list products", "which products", "what products", "product names"]):
+        return {"answer": sorted({r.get("product") for r in filtered if r.get("product")})}
+
+    if "refund" in ql or "refunded" in ql:
+        refunded = [r for r in filtered if str(r.get("status", "")).lower() == "refunded"]
+        total = sum((amount_usd(r, rates) for r in refunded), Decimal("0"))
+        return {
+            "refunded_orders": len(refunded),
+            "refunded_amount_usd": str(total.quantize(Decimal("0.01"))),
+            "note": "This uses the amount on rows whose current status is refunded; it is not a separate refund transaction ledger.",
+        }
+
+    if any(k in ql for k in ["average", "avg", "mean"]):
+        paid = [r for r in filtered if str(r.get("status", "")).lower() == "paid"]
+        if not paid:
+            return {"answer": "No paid orders matched the filters."}
+        total = sum((amount_usd(r, rates) for r in paid), Decimal("0"))
+        return {"average_paid_order_usd": str((total / len(paid)).quantize(Decimal("0.01"))), "orders_counted": len(paid)}
+
+    return {
+        "matched_orders": len(filtered),
+        "orders": filtered[:50],
+        "hint": "Ask for revenue/sales, order count, products, refunds, average order value, a region/product, customer ID (e.g. C1213), and/or month/year.",
+    }
+
+
+DATA_ROWS: list[dict[str, Any]] = []
+RATES: dict[str, Any] = {}
+LOAD_ERROR: str | None = None
+RAW_COUNT = 0
 
 
 @app.on_event("startup")
 def startup():
-    global ENTRY_DATA, DISCOVERED
-    ENTRY_DATA, DISCOVERED = load_source()
+    global DATA_ROWS, RATES, LOAD_ERROR, RAW_COUNT
+    try:
+        DATA_ROWS, RATES, RAW_COUNT, _ = load_ledger()
+        LOAD_ERROR = None
+    except Exception as e:
+        LOAD_ERROR = f"{type(e).__name__}: {e}"
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": APP_TITLE, "endpoint": "/answer"}
+    return {"status": "ok" if LOAD_ERROR is None else "degraded", "service": APP_TITLE, "endpoint": "/answer"}
+
+
+@app.get("/health")
+def health_detail():
+    return {
+        "status": "ok" if LOAD_ERROR is None else "degraded",
+        "load_error": LOAD_ERROR,
+        "raw_rows_loaded": RAW_COUNT,
+        "unique_current_orders": len(DATA_ROWS),
+        "rates": RATES,
+    }
+
+
+@app.post("/answer")
+def answer(body: Question):
+    if LOAD_ERROR:
+        raise HTTPException(status_code=503, detail=f"Could not load ledger source: {LOAD_ERROR}")
+    return answer_question(body.question, DATA_ROWS, RATES)
 
 
 @app.get("/debug/source")
 def debug_source():
-    # Useful during setup; remove or protect this route for production if desired.
+    # Do not expose the signed source URL.
     return {
-        "entry": ENTRY_DATA,
-        "discovered_urls": list(DISCOVERED.keys()),
-        "discovered_summaries": {
-            u: (list(v.keys())[:40] if isinstance(v, dict) else type(v).__name__)
-            for u, v in DISCOVERED.items()
-        },
+        "load_error": LOAD_ERROR,
+        "raw_rows_loaded": RAW_COUNT,
+        "unique_current_orders": len(DATA_ROWS),
+        "rates": RATES,
+        "sample_orders": DATA_ROWS[:3],
     }
-
-
-def flatten_records(value: Any, path: str = "") -> list[dict[str, Any]]:
-    records = []
-    if isinstance(value, list):
-        for item in value:
-            records.extend(flatten_records(item, path))
-    elif isinstance(value, dict):
-        # Treat dictionaries with common ledger fields as records.
-        keys = {str(k).lower() for k in value}
-        if keys & {"order_id", "orderid", "customer", "customer_id", "product", "product_name", "quantity", "unit_price", "price", "revenue", "amount", "refund", "refund_amount", "region", "date", "order_date"}:
-            records.append(value)
-        for k, v in value.items():
-            if isinstance(v, (dict, list)):
-                records.extend(flatten_records(v, f"{path}/{k}"))
-    return records
-
-
-def all_records() -> list[dict[str, Any]]:
-    records = []
-    seen = set()
-    for url, data in DISCOVERED.items():
-        for record in flatten_records(data):
-            marker = json.dumps(record, sort_keys=True, default=str)
-            if marker not in seen:
-                seen.add(marker)
-                records.append(record)
-    for record in flatten_records(ENTRY_DATA):
-        marker = json.dumps(record, sort_keys=True, default=str)
-        if marker not in seen:
-            seen.add(marker)
-            records.append(record)
-    return records
-
-
-def norm(s: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
-
-
-def field(record: dict[str, Any], *names: str) -> Any:
-    by_norm = {norm(k).replace(" ", "_"): v for k, v in record.items()}
-    for name in names:
-        n = norm(name).replace(" ", "_")
-        if n in by_norm:
-            return by_norm[n]
-    return None
-
-
-def money(v: Any) -> Decimal:
-    try:
-        if isinstance(v, str):
-            v = v.replace("$", "").replace(",", "").strip()
-        return Decimal(str(v or 0))
-    except Exception:
-        return Decimal("0")
-
-
-def date_parts(v: Any) -> tuple[int | None, int | None]:
-    s = str(v or "")
-    m = re.search(r"(20\d{2})[-/](\d{1,2})", s)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    m = re.search(r"(\d{1,2})[-/](20\d{2})", s)
-    if m:
-        return int(m.group(2)), int(m.group(1))
-    return None, None
-
-
-MONTHS = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
-    "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
-    "november": 11, "nov": 11, "december": 12, "dec": 12,
-}
-
-
-def parse_period(q: str):
-    ql = q.lower()
-    year_match = re.search(r"\b(20\d{2})\b", ql)
-    year = int(year_match.group(1)) if year_match else None
-    month = next((n for name, n in MONTHS.items() if re.search(r"\b" + re.escape(name) + r"\b", ql)), None)
-    return year, month
-
-
-def choose_amount(record: dict[str, Any], want_refunds: bool) -> Decimal:
-    if want_refunds:
-        for n in ("refund_amount", "refund", "refunded_amount", "total_refund"):
-            v = field(record, n)
-            if v is not None:
-                return money(v)
-    for n in ("revenue", "total_amount", "order_total", "amount", "sales_amount", "total", "line_total"):
-        v = field(record, n)
-        if v is not None:
-            return money(v)
-    qty = field(record, "quantity", "qty", "units")
-    price = field(record, "unit_price", "price", "selling_price")
-    if qty is not None and price is not None:
-        return money(qty) * money(price)
-    return Decimal("0")
-
-
-def answer_question(question: str) -> Any:
-    q = question.strip()
-    ql = q.lower()
-    records = all_records()
-    if not records:
-        return "The ledger data could not be loaded from the source API."
-
-    # Match region/product/customer/month/year and common metric intent.
-    year, month = parse_period(q)
-    region_terms = ["north", "south", "east", "west", "central", "northeast", "northwest", "southeast", "southwest"]
-    region = next((r for r in region_terms if re.search(r"\b" + r + r"\b", ql)), None)
-    products = sorted({str(field(r, "product_name", "product", "item", "sku_name")) for r in records if field(r, "product_name", "product", "item", "sku_name") is not None}, key=len, reverse=True)
-    customers = sorted({str(field(r, "customer_name", "customer", "client_name")) for r in records if field(r, "customer_name", "customer", "client_name") is not None}, key=len, reverse=True)
-    product = next((x for x in products if x.lower() in ql), None)
-    customer = next((x for x in customers if x.lower() in ql), None)
-
-    want_refunds = any(x in ql for x in ("refund", "refunded", "returned"))
-    want_count = any(x in ql for x in ("how many", "count", "number of orders", "number of customers"))
-    want_customers = "customer" in ql and any(x in ql for x in ("how many", "count", "number", "unique", "distinct"))
-    want_product_list = any(x in ql for x in ("which products", "list products", "what products", "product names"))
-    filtered = []
-    for r in records:
-        d = field(r, "date", "order_date", "created_at", "transaction_date", "timestamp")
-        ry, rm = date_parts(d)
-        if year is not None and ry is not None and year != ry:
-            continue
-        if month is not None and rm is not None and month != rm:
-            continue
-        if region:
-            rr = field(r, "region", "sales_region", "territory")
-            if rr is None or region not in str(rr).lower():
-                continue
-        if product and str(field(r, "product_name", "product", "item", "sku_name")) != product:
-            continue
-        if customer and str(field(r, "customer_name", "customer", "client_name")) != customer:
-            continue
-        filtered.append(r)
-
-    if want_product_list:
-        names = sorted({str(field(r, "product_name", "product", "item", "sku_name")) for r in filtered if field(r, "product_name", "product", "item", "sku_name") is not None})
-        return names
-
-    if want_customers:
-        names = {str(field(r, "customer_id", "customer_name", "customer", "client_name")) for r in filtered if field(r, "customer_id", "customer_name", "customer", "client_name") is not None}
-        return len(names)
-
-    if want_count:
-        ids = [field(r, "order_id", "orderid", "id") for r in filtered]
-        return len(set(map(str, ids))) if any(x is not None for x in ids) else len(filtered)
-
-    amounts = [choose_amount(r, want_refunds) for r in filtered]
-    if any(x in ql for x in ("average", "avg", "mean")):
-        return round(float(sum(amounts, Decimal(0)) / max(len(amounts), 1)), 2)
-    if any(x in ql for x in ("highest", "largest", "most")) and ("order" in ql or "customer" in ql or "product" in ql):
-        # Return the label for the highest aggregate group when possible.
-        group_key = "customer_name" if "customer" in ql else ("product_name" if "product" in ql else "order_id")
-        totals = {}
-        for r in filtered:
-            label = field(r, group_key, group_key.replace("_", " "), "product", "customer", "order_id")
-            if label is not None:
-                totals[str(label)] = totals.get(str(label), Decimal(0)) + choose_amount(r, want_refunds)
-        if totals:
-            return max(totals.items(), key=lambda x: (x[1], x[0]))[0]
-    return round(float(sum(amounts, Decimal(0))), 2)
-
-
-@app.post("/answer")
-@app.post("/")
-def answer(payload: Question):
-    try:
-        return {"answer": answer_question(payload.question)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to answer question: {exc}")
